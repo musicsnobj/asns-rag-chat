@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from anthropic import AnthropicBedrock
 from typing import List, Dict, Any
+from enum import Enum
 from pydantic import BaseModel, Field
 
 
@@ -36,6 +37,19 @@ dynamodb = boto3.resource("dynamodb")
 chat_request_table = dynamodb.Table(CHAT_TABLE_NAME)
 transcript_table = dynamodb.Table(TRANSCRIPT_TABLE_NAME)
 
+class DialogLabel(str, Enum):
+    TOPIC = "TOPIC"
+    TONE = "TONE"
+    MIXED = "MIXED"
+
+class DialogTone(str, Enum):
+    DEBATE = "DEBATE"
+    BANTER = "BANTER"
+    LOGISTICS = "LOGISTICS"
+
+class LabelDecision(BaseModel):
+    label: DialogLabel = Field(description="the classification assigned to user query which will inform RAG strategy")
+
 class RelevanceDecision(BaseModel):
     is_relevant: bool = Field(description="Overall determination of whether a piece of context is useful for answering user query")
     confidence: int = Field(description="Confidence score (0-100) from the LLM regarding determination of relevance", ge=0, le=100)
@@ -51,6 +65,8 @@ class SearchQuery(BaseModel):
             " or None if no filters are applicable"
         )
     )
+    label: DialogLabel = Field(description="the style of conversation specified in user query (TOPIC, TONE, or MIXED)")
+    tone: DialogTone | None = Field(description="the tone of conversation specified in user query (BANTER, DEBATE, or LOGISTICS)")
 
 class TranscriptLine(BaseModel):
     episode_id: str = Field(description="Episode ID of transcript")
@@ -65,6 +81,7 @@ class TranscriptLine(BaseModel):
 class TranscriptExchange(BaseModel):
     episode_id: str = Field(description="Episode ID of exchange")
     date: str = Field(description="Date of recording")
+    timestamp: str = Field(description="Timestamp of the exchange relative to start of episode")
     lines: list[TranscriptLine] = Field(description="A sequence of lines from episode transcript")
     score: int = Field(description="K-NN similarity score of the central line of the exchange")
 
@@ -89,35 +106,100 @@ CONTINUATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-QUERY_TO_KNN_PROMPT = (
-    "You are a helpful research assistant tasked with analyzing a semantic search query"
-    " and identifying any filters that should be applied in data retrieval from an S3 "
-    "Vectors bucket. Each vector in the S3 Vectors bucket contains an embedded dialogue "
-    "line from the 'However Comma' podcast hosted by Jack Brett and Jess. The vector "
-    "collection has three filterable metadata fields:\n"
-    "speaker (string) - name of podcast host who spoke the line, must be either 'Jess' or 'Jack Brett', e.g. 'Jess'\n"
-    "date (string) - date of podcast episode in YYYY-MM-DD format, e.g. '2025-10-31'\n"
-    "date_ts (number) - numeric representation of the podcast date in YYYYMMDD format, e.g. 20251031\n"
-    "With this in mind, your task is to read the input query, determine if any of the above "
-    "filters should be applied to the semantic search. If there are applicable filters, you must also "
-    "revise the input query to scrub out any references to the metadata we plan to filter (this is to achieve"
-    " cleaner semantic search results given e.g. lines spoken by Jess on 2025-02-04 will not likely contain Jess'"
-    " name or the podcast date, best to leave them out of the semantic search query). Your output "
-    "must be a JSON-parsable object with two fields:\n"
-    "query (string) - revised semantic search query excluding references to metadata filters (or "
-    "the original query if no filters are applicable)\n"
-    "filter_exp (JSON object) - an elasticsearch filter expression to apply the identified filters "
-    "(or None if no filters are applicable).\n"
-    "Examples:\n"
-    "1. For query 'Fetch any statements that indicate Jack Brett's position on free will', you would output:\n"
-    "{\"query\": \"opinions about free will\", \"filter_exp\": {\"speaker\": {\"$eq\": \"Jack Brett\"}}}\n"
-    "2. For query 'Fetch any statements Jess made about Trump's alleged pandering to White Supremacists in early 2025 (January-March)',"
-    " you would output:\n"
-    "{\"query\": \"Trump alleged pandering to White Supremacists\", \"filter_exp\": {\"$and\": [{\"speaker\": {\"$eq\": \"Jess\"}}, {\"date_ts\": {\"$gte\": 20250101}}, {\"date_ts\": {\"$lte\": 20250331}}]}}\n"
-    "3. For query 'Fetch any discussions about the murder of Charlie Kirk', you would output:\n"
-    "{\"query\": \"murder of Charlie Kirk\", \"filter_exp\": \"None\"}\n"
-    "Return only the JSON filter expression, no prose or additional reasoning."
-)
+QUERY_TO_KNN_PROMPT = textwrap.dedent("""
+    You are a helpful research assistant tasked with analyzing a semantic search query and determining the following:
+    1. the label (TOPIC, TONE, or MIXED) that best fits the query,
+    2. if tone is referenced in the query (i.e. label is TONE or MIXED), which of the following labels best describes the desired tone (otherwise "None"):\n
+    DEBATE: political, argumentative, topical rather than personal, opinionated, persuasive\n
+    BANTER: personal, playful, joking, anecdotes, interests\n
+    LOGISTICS: planning, strategizing about the life events or content for the podcast, goal-oriented, productive\n
+    3. any filters that should be applied in data retrieval
+    The data source is an S3 Vectors bucket containing all the embedded dialogue from the 'However Comma' podcast hosted by Jack Brett and Jess. The vector collection has three filterable metadata fields:\n
+    speaker (string) - name of podcast host who spoke the line, must be either 'Jess' or 'Jack Brett', e.g. 'Jess'\n
+    date (string) - date of podcast episode in YYYY-MM-DD format, e.g. '2025-10-31'\n
+    date_ts (number) - numeric representation of the podcast date in YYYYMMDD format, e.g. 20251031\n
+    With this in mind, your task is to read the input query, determine if any of the above filters should be applied to the semantic search. If there are applicable filters, you must also revise the input query to scrub out any references to the metadata we plan to filter (this is to achieve cleaner semantic search results given e.g. lines spoken by Jess on 2025-02-04 will not likely contain Jess' name or the podcast date, best to leave them out of the semantic search query). Your output must be a JSON-parsable object with two fields:\n
+    query (string) - revised semantic search query excluding references to metadata filters (or the original query if no filters are applicable)\n
+    filter_exp (JSON object) - an elasticsearch filter expression to apply the identified filters (or None if no filters are applicable).\n
+    Examples:\n
+    1. For query 'Fetch any statements that indicate Jack Brett's position on free will', you would output:\n
+    {"query": "opinions about free will", "label": "TOPIC", "tone": "None", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
+    2. For query 'Fetch any argumentative statements Jess made about Trump's alleged pandering to White Supremacists in early 2025 (January-March)', you would output:\n
+    {"query": "Argumentative statements about Trump pandering to White Supremacists", "label": "MIXED", "tone": "DEBATE", "filter_exp": {"$and": [{"speaker": {"$eq": "Jess"}}, {"date_ts": {"$gte": 20250101}}, {"date_ts": {"$lte": 20250331}}]}}\n
+    3. For query 'Fetch any discussions about the murder of Charlie Kirk', you would output:\n
+    {"query": "murder of Charlie Kirk", "label": "TOPIC", "tone": "None", "filter_exp": "None"}\n
+    4. For query 'Jack Brett joking about his sparse sexual history', you would output:\n
+    {"query": "jokes about sexual history", "label": "MIXED", "tone": "BANTER", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
+    Return only the JSON filter expression, no prose or additional reasoning.
+""")
+
+TONE_DESCRIPTIONS = {
+    DialogTone.DEBATE: "political, argumentative, topical rather than personal, opinionated, persuasive",
+    DialogTone.BANTER: "personal, playful, joking, anecdotes, interests",
+    DialogTone.LOGISTICS: "planning, strategizing about the life events or content for the podcast, goal-oriented, productive",
+}
+TONE_EXAMPLES = {
+    DialogTone.DEBATE: textwrap.dedent("""
+        Well if you're going to tell people that what you believe that this is what you actually believe is going on you lying about your podcast is gotta be if it it may not be illegal but it is absolutely 1000% unequivocally unethical, Would you agree with that, Yeah Ok So then you're telling me all of these people all of these mothers with already too much on their plate All of these like scientists who you know want to be banned for saying what they want to try to like no one takes you seriously if you're into this and just nobody does it and like all of this stuff every single one of them is feeding into this, perversion out of monetary gain, the level one the level of unethical just astounds me I don't understand how we as a as a internet savvy technology species would not have immediately sniffed that shit out and it would have blown up all over the internet Like, that doesn't seem that seems like a weird thing that has not happened and should have if that's the case Does that make sense
+        Yes Which is what I'm saying is they if that's the case they must be paid actors and if they are paid actors all of them it doesn't make sense that that would not have gotten found out by now and spread all over the internet
+        And I'm saying that like they don't have to be paid actors more than uh dear Band and Bors the the like uh that the COVID vaccine skeptic that my father sends me that I you know sent me the links to um like the fact that he was lying through his teeth has resulted in explosive scandal like having an advanced degree, and making a false claim as it happens does not do anything in the in in this day and age Like I mean maybe you've had a bill nice sort of reputation that that might make a difference But some neurologist no one's heard of uh like change like or at least you've never heard of before This podcast changes their mind Oh wow, Like there's just so many ways that
+        if this were a courtroom setting like I would say objection asked and answered because you keep on accusing me or you keep on telling me that I'm accusing all these people of lying and being part of a vast conspiracy When I have said no they probably believe that their kid is special They probably believe they have a special way of communicating with them, And in in every single one of these cases there is some explanation other than uh they have telepathic abilities something which is an extraordinary claim which has never been proven And this is not proof that that's all I'm saying I'm not saying they're lying and I don't have to prove anyone's lying I just have to say they don't have proof show me the proof then I'm interested
+        Yes But in my mind like I interpreted as like it's a it's a rigged system like the the sheep is the the the voters who the system of democracy makes them think that they have a voice when in fact like elections are controlled by forces beyond our control by the fat cats and, uh in in in the shadows who are just funneling money into these into whatever campaigns are going to support their their pork barrel causes And so like we don't actually have a choice of what's for dinner We just you know we we cast our vote Uh But uh we're we're uh we're dreaming if we think it means a damn thing
+        So but but the fact that it's winner take all in almost every state like that and the fact that the like the electoral college being a thing allows for that as opposed to just counting every vote even like third party votes like making it so that your vote actually does count, Um Like, so you you you would still support the electoral college
+        Yes I I would say I would say that the winner take all system does more to hurt than help but that the electoral college system itself is still better than popular vote
+    """),
+    DialogTone.BANTER: textwrap.dedent("""
+        I'm trying to figure out what to do tomorrow because like half of it is gonna be taken up by, errands
+        As in your friend Erin Talberg or errands as in going to the store and getting things
+        the latter, So, I can't do like a full Wednesday thing
+        Do you ever run errands with Erin
+        No but we couch rot sometimes
+        What's cow trotting
+        She just comes over for a few hours and we sit on the couch and do nothing
+        Oh couch rotting Oh I thought you said cow trotting Like you go out to the ranch and each of you picks out a cow and you just trot them along the trail while you know doing girl talk
+        you don't do that
+        I mean I'd never heard of the practice of couch rotting which is why I was so Yeah
+        The the gift of Gary Oldman's amusement that he gave to the world was just, delightful
+        It was amazing, Uh The far took was great I mean it was more than just one but one particularly memorable after the death scene, I'm just gonna add something to this, Yeah
+        Yeah That's the reason that I don't feel like you would enjoy the character Jackson and Lamb Are you because like he's Gary Oldman and you can't be sexually attracted to him because of how often he farts Uh but it is a very well written character But anyway um what I what I especially liked about the interview Yeah I guess I mean if you've seen it there's nothing I can tell you about it that you don't know But like I love his tip about playing a evil looking character or a uh um, at least a tough looking character where you ii I wanted to try, you bring up the bring up the head first, than the eyes
+        Yeah Yeah he does That that's a thing he does
+        How's your workout regimen
+        I have not kept up mostly I think because of this fucking crazy project Like I'm I'm working, until the evening times, Still, It yeah they're tomorrow's the last day for it because um the their their presentation is Thursday So it's it's going to end shortly But um and then I will hopefully try to be able to, get back into it, Uh, but yeah I'm gonna and then I'm gonna talk to Jeremy, about quitting, either Thursday or Friday
+        Ok, I bet you are super looking forward to that
+        so, much
+        I told that I told that to my therapist, I was like, I mean it's fine I just you know I am rooting for the aliens I don't care if it's education or a peaceful whatever it is Just let's get this going
+        We clearly cannot be trusted to handle our own uh shit So
+        I mean she seems like someone who really does her homework and uh totally legit, I would feel more comfortable if like there was a second source or or you know maybe a few more sources verified But of course you know if the alien has a special connection with her, and, you know we'll only communicate through her then I guess nothing we can do about that But you know where have I heard that sort of system before I think, I think like in the Bible with the burning bush and Moses the 10 Commandments on the top of the mountain and all that like it always seems to be just one prophet whose job it is to carry these messages from on high down to us Oh yeah And every other person who's like claimed to uh to to have an alien sighting they they have like a special message for us, Uh but it only goes through them and I feel like I don't know that that's that's just like the whole prophet model, It's hard to put much stock in that because believe it or not a few of these guys have been full of shit
+        Some are yeah for sure But not her
+        not her Of course I mean I can't I can't she cannot be full of shit You you have no idea how much I need this
+        it fills me with hope that we'll see spaceships in the sky visible day and night within a week and a week of a week More of Trump I can do
+        And and there's like the leggings as pants phenomena where like that is such a ubiquitous thing Now it's like I mean we're supposed to treat it, as normal, because like sure I've been captivated by the female buttocks but it and it was always such a rare sight to see but now it is very frequent now it is everywhere I look
+        If are you saying maybe it's like wait, if you've been seeing women's butts and leggings since birth you might not have the attraction or are you trying to say
+        and honestly it's like well I mean you know this about me that it's actually more attractive to see them in the pants oftentimes because it is the modern day spandex Like Lulu's they have the shaping, Yeah they like actually hug you in a flattering way And which is yeah to me seeing that is sexier than seeing a naked body, but I don't know what it means for my sexual identity, and like it was a fetish for me before before it became a ubiquitous fashion trend
+    """),
+    DialogTone.LOGISTICS: textwrap.dedent("""
+        Well you did mention uh the possibility of, releasing the video just like the the human video of us in full length with uh just the uh like um ha have that be the podcast and have the uh cartoon be a segment of it and use it for promotional purposes Um does does that idea is that idea still something you're thinking of
+        Um if that's still something you're interested in exploring
+        I was thinking that could be a, uh that that like yeah I mean I guess, it depends on the level of interest in uh maybe we we start with the the cartoon version and if there's enough interest in that if if like uh let's let's let somebody demand that hey are the full scale or the full length videos of these uh uh conversations available anywhere online and and then and if there's enough call for that we uh we maybe go in that direction I don't know That sounds that seems like, well yeah
+        It would take longer to do the longer animated segments just in terms of how much free time I have So if we wanted quantity, with as best quality as we can right now, it would be, us on video edited into segments into one long thing and then the animated pieces in the middles in the front middle and end, for the sections or whatever that would be much much more manageable time wise, if you would agree to that So then I will then next just take one of these episodes and do that, and then send them to you separately and see, if you think they work as segments for a full, thing or if you just want to release them as separate things or
+        Yeah Lovely, Yeah Totally Like since since you've posed this idea of like my brain's been thinking of like how how we would segment up these episode how we would like uh, um cut it down to like the the real meat and potatoes of it Um uh But yeah I I think there's yeah and and I'd be interested in like experimenting with that and seeing how, uh how long a political segment like how long a uh a show is when we trim the ft, Yeah But yeah all that to say I agree with the strategy and I'm happy to be a part of it
+        yes, Dragon Con and the fact that Rachel will not be staying with us, we'll get to meet Max and hopefully they are cool
+        I'm mostly worried because like the airbnb people are notorious for canceling shit around Dragon Con So like if they don't have a place to stay, Like, what a day in a day
+        That is a good well I don't know I I hadn't known that about airbnb but it makes perfect sense Given the, a high value of real estate around the, Atlanta area at the time of Dragon Con historically speaking
+        Yes I mean that seems like the only logical, thing to shed And so perhaps, could you push his buttons What what are his buttons that you could, push Maybe like renew your sort of loyalty to Richter Studios in the same conversation that you announced that you can't be with him on this thing
+        Yeah How would I do, that
+        Um So I I would think like make a video like the sort of video that he would have wanted you to present um, that you know sells the company in the way whatever way he wants you want you to sell it at this presentation and yourself is in it like personal testimonial
+        Yeah I think that's a good idea, because it requires it only requires my time to sacrifice and it would alleviate a huge thing So maybe I can like, record it somehow, and just be like hey but I still I still need a reason why I can't go
+        Um, and that that that's where the having to lie comes in unless you actually do get COVID or something Um, yeah But like yeah because I guess it's an untenable situation Like it is not untenable but it is one where you have to do the unfortunate thing of lying as you know, we as as humans like to avoid but you do have obligation to your employer and obligation to those freelancers and neither of them know about each other So yeah
+        I have put myself in the chaos yes
+        something's gotta give, Uh And unfortunately that means that you have to tell a falsehood of some kind to free up a bit of your time Um And yeah I would do that in your position without hesitation
+        Oh, I looked up a prompt engineer job
+        Oh Yeah The Prompt engineer Um, It's not impossible for people without a degree in it to get it and you don't necessarily need to know how to code but it is really helpful, Um, And so I would have to dig into it far deeper to know if it would be worth my time
+        If you want some coding lessons I can do that, I like the coding lessons that are like specific to the field of um you know interacting with large language models It's you would be you would pick it up like with your like experience with animation and you know just kind of like programmatic elements I feel like you you would you would pick up on it
+        I'm thinking, about it I I don't even know if it's worth the time to delve into it yet So I have to still consider, that part
+        But yeah like even if you think that just setting up a local Python environment would inspire you to, explore on your own I could do that just like take that simple step and you know just give you the playground to do what you will
+    """),
+}
 
 def is_referential(query: str) -> bool:
     """
@@ -180,8 +262,40 @@ def embed_text(text: str) -> List[float]:
     return body["embedding"]
 
 
-def retrieve_context(query: str) -> List[Dict[str, Any]]:
-    knn_query = anthropic_client.messages.create(
+def get_hyde_prompt_for_query_and_tone(query: str, tone: str) -> str:
+    description = TONE_DESCRIPTIONS[tone]
+    sample_dialog = TONE_EXAMPLES[tone]
+    return textwrap.dedent(f"""
+        Your task is to generate realistic dialogue exchanges matching a specific tone to answer a user query.
+        TONE: {tone}
+        FEATURES: {description}
+        EXAMPLES:
+        {sample_dialog}
+        Generate 3 exchanges separated by new lines, matching this tone and relevant to the query: {query}
+    """)
+
+def generate_hypothetical_documents(query: str, tone: DialogTone) -> list[str]:
+    hy_docs_resp = bedrock_runtime.invoke_model(
+        modelId=CHAT_MODEL_ID,
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 600,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": get_hyde_prompt_for_query_and_tone(query, tone)
+                }
+            ]
+        })
+    )
+    resp_body = json.loads(hy_docs_resp["body"].read())
+    llm_output = resp_body["content"][0]["text"]
+    # filter out any blank/whitespace lines from result
+    return [line for line in llm_output.split('\n') if line.strip()]
+
+def get_knn_search_query(query: str) -> SearchQuery:
+    search_query = anthropic_client.messages.create(
         model=CHAT_MODEL_ID,
         response_model=SearchQuery,
         max_tokens=500,
@@ -194,9 +308,10 @@ def retrieve_context(query: str) -> List[Dict[str, Any]]:
             }
         ]
     )
-    print(f"query: {knn_query.query}")
-    print(f"filter_exp: {knn_query.filter_exp}")
-    query_embedding = embed_text(knn_query.query)
+    return search_query
+
+def get_top_k_vectors(text: str, filter_exp: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    query_embedding = embed_text(text)
     
     response = s3vectors.query_vectors(
         vectorBucketName=VECTOR_BUCKET_NAME,
@@ -205,10 +320,28 @@ def retrieve_context(query: str) -> List[Dict[str, Any]]:
         topK=TOP_K,
         returnMetadata=True,
         returnDistance=True,
-        filter=knn_query.filter_exp
+        filter=filter_exp
     )
     return response.get("vectors", [])
 
+def retrieve_context(query: str) -> List[Dict[str, Any]]:
+    vectors = []
+    knn_query = get_knn_search_query(query)
+    print(f"query: {knn_query.query}")
+    print(f"filter_exp: {knn_query.filter_exp}")
+    print(f"label: {knn_query.label}")
+    print(f"tone: {knn_query.tone}")
+    if knn_query.label in [DialogLabel.TONE, DialogLabel.MIXED]:
+        # use HyDE strategy
+        print("Tone detected. Generating hypothetical documents...")
+        hyde_docs = generate_hypothetical_documents(knn_query.query, knn_query.tone)
+        for hd in hyde_docs:
+            print(hd)
+            vectors.extend(get_top_k_vectors(hd, knn_query.filter_exp))
+    else:
+        # skip HyDE. query is topic-specific enough
+        vectors.extend(get_top_k_vectors(knn_query.query, knn_query.filter_exp))
+    return vectors
 
 def get_search_tasks_for_query(query: str) -> List[str]:
     """
@@ -342,12 +475,14 @@ def get_n_surrounding_lines(vector: Dict[str, Any], n: int = 3) -> TranscriptExc
             ScanIndexForward=True
         )
         adjacent_lines = adjacent_lines_resp.get("Items")
+        start_timestamp = adjacent_lines[0]["timestamp"]
 
         return TranscriptExchange(
             episode_id=episode_id,
             date=episode_date,
             score=score,
-            lines=adjacent_lines
+            lines=adjacent_lines,
+            timestamp=start_timestamp
         )
     except Exception as e:
         print(f"Error occurred fetching surrounding lines: {e}")
