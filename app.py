@@ -26,7 +26,8 @@ EMBED_MODEL_ID = os.environ["EMBED_MODEL_ID"]
 CHAT_MODEL_ID = os.environ["CHAT_MODEL_ID"]
 RELEVANCE_MODEL_ID = os.environ["RELEVANCE_MODEL_ID"]
 VECTOR_BUCKET_NAME = os.environ["VECTOR_BUCKET_NAME"]
-VECTOR_INDEX_NAME = os.environ["VECTOR_INDEX_NAME"]
+LINE_INDEX_NAME = os.environ["LINE_INDEX"]
+DIALOG_INDEX_NAME = os.environ["DIALOG_INDEX"]
 CHAT_TABLE_NAME = os.environ["CHAT_TABLE_NAME"]
 TRANSCRIPT_TABLE_NAME = os.environ["TRANSCRIPT_TABLE_NAME"]
 
@@ -55,7 +56,7 @@ class RelevanceDecision(BaseModel):
     confidence: int = Field(description="Confidence score (0-100) from the LLM regarding determination of relevance", ge=0, le=100)
     reason: str = Field(description="A one-sentence explanation of the LLM's reasoning behind determination of relevance")
 
-class SearchQuery(BaseModel):
+class LineQueryKNN(BaseModel):
     query: str = Field(
         description="Revised semantic search query excluding filter information for cleaner results"
     )
@@ -65,8 +66,11 @@ class SearchQuery(BaseModel):
             " or None if no filters are applicable"
         )
     )
-    label: DialogLabel = Field(description="the style of conversation specified in user query (TOPIC, TONE, or MIXED)")
-    tone: DialogTone | None = Field(description="the tone of conversation specified in user query (BANTER, DEBATE, or LOGISTICS)")
+class DialogQueryKNN(BaseModel):
+    query: str = Field(
+        description="Revised semantic search query excluding filter information for cleaner results"
+    )
+    tone: DialogTone | None = Field(description="the tone of conversation specified in user query (BANTER, DEBATE, LOGISTICS, or None)")
 
 class TranscriptLine(BaseModel):
     episode_id: str = Field(description="Episode ID of transcript")
@@ -83,6 +87,13 @@ class TranscriptExchange(BaseModel):
     date: str = Field(description="Date of recording")
     timestamp: str = Field(description="Timestamp of the exchange relative to start of episode")
     lines: list[TranscriptLine] = Field(description="A sequence of lines from episode transcript")
+    score: int = Field(description="K-NN similarity score of the central line of the exchange")
+
+class RelevantVector(BaseModel):
+    episode_id: str = Field(description="Episode ID of exchange")
+    date: str = Field(description="Date of recording")
+    timestamp: str = Field(description="Timestamp of the exchange relative to start of episode")
+    text: str = Field(description="Stringified sequence of lines from episode transcript")
     score: int = Field(description="K-NN similarity score of the central line of the exchange")
 
 # regex patterns to detect when user prompt refers to earlier chat history
@@ -106,14 +117,9 @@ CONTINUATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-QUERY_TO_KNN_PROMPT = textwrap.dedent("""
-    You are a helpful research assistant tasked with analyzing a semantic search query and determining the following:
-    1. the label (TOPIC, TONE, or MIXED) that best fits the query,
-    2. if tone is referenced in the query (i.e. label is TONE or MIXED), which of the following labels best describes the desired tone (otherwise "None"):\n
-    DEBATE: political, argumentative, topical rather than personal, opinionated, persuasive\n
-    BANTER: personal, playful, joking, anecdotes, interests\n
-    LOGISTICS: planning, strategizing about the life events or content for the podcast, goal-oriented, productive\n
-    3. any filters that should be applied in data retrieval
+QUERY_TO_LINE_KNN_PROMPT = textwrap.dedent("""
+    You are a helpful research assistant tasked with analyzing a user query and helping to optimize it for semantic search via K-NN.
+    This means determining which if any available metadata filters that should be applied in data retrieval.
     The data source is an S3 Vectors bucket containing all the embedded dialogue from the 'However Comma' podcast hosted by Jack Brett and Jess. The vector collection has three filterable metadata fields:\n
     speaker (string) - name of podcast host who spoke the line, must be either 'Jess' or 'Jack Brett', e.g. 'Jess'\n
     date (string) - date of podcast episode in YYYY-MM-DD format, e.g. '2025-10-31'\n
@@ -123,14 +129,44 @@ QUERY_TO_KNN_PROMPT = textwrap.dedent("""
     filter_exp (JSON object) - an elasticsearch filter expression to apply the identified filters (or None if no filters are applicable).\n
     Examples:\n
     1. For query 'Fetch any statements that indicate Jack Brett's position on free will', you would output:\n
-    {"query": "opinions about free will", "label": "TOPIC", "tone": "None", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
+    {"query": "opinions about free will", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
     2. For query 'Fetch any argumentative statements Jess made about Trump's alleged pandering to White Supremacists in early 2025 (January-March)', you would output:\n
-    {"query": "Argumentative statements about Trump pandering to White Supremacists", "label": "MIXED", "tone": "DEBATE", "filter_exp": {"$and": [{"speaker": {"$eq": "Jess"}}, {"date_ts": {"$gte": 20250101}}, {"date_ts": {"$lte": 20250331}}]}}\n
+    {"query": "Argumentative statements about Trump pandering to White Supremacists", "filter_exp": {"$and": [{"speaker": {"$eq": "Jess"}}, {"date_ts": {"$gte": 20250101}}, {"date_ts": {"$lte": 20250331}}]}}\n
     3. For query 'Fetch any discussions about the murder of Charlie Kirk', you would output:\n
-    {"query": "murder of Charlie Kirk", "label": "TOPIC", "tone": "None", "filter_exp": "None"}\n
+    {"query": "murder of Charlie Kirk", "filter_exp": "None"}\n
     4. For query 'Jack Brett joking about his sparse sexual history', you would output:\n
-    {"query": "jokes about sexual history", "label": "MIXED", "tone": "BANTER", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
-    Return only the JSON filter expression, no prose or additional reasoning.
+    {"query": "jokes about sexual history", "filter_exp": {"speaker": {"$eq": "Jack Brett"}}}\n
+    Return only the JSON object, no prose or additional reasoning.
+""")
+
+QUERY_TO_DIALOG_KNN_PROMPT = textwrap.dedent("""
+    You are a helpful research assistant tasked with analyzing a user query and helping to optimize it for semantic search via K-NN.
+    This means determining whether to apply metadata filters in data retrieval.
+    The data source is an S3 Vectors bucket containing all the embedded dialogue, minus speaker labels, from the 'However Comma' podcast hosted by Jack Brett and Jess.
+    The vector collection has one filterable metadata field:\n
+    tone (string) - the tone of transcript segment (BANTER, DEBATE, or LOGISTICS)
+    With this in mind, your task is to read the input query and determine if results should be filtered down to one of the three specified dialog tones:\n
+    BANTER - personal, playful, joking, anecdotes, interests\n
+    DEBATE - political, argumentative, topical rather than personal, opinionated, persuasive\n
+    LOGISTICS - planning, strategizing about the life events or content for the podcast, goal-oriented, productive\n
+    If 'tone' filter should be applied, you must also revise the input query to scrub out any references to the metadata we plan to filter (so as to achieve cleaner semantic search results given e.g. dialogue exchanges of type BANTER won't likely contain the word 'banter', best to leave them out of the semantic search query).
+    If input query concerns which host said something e.g. "Fetch any statements by Jess calling for an alien takeover of earth", those host name(s) must be scrubbed from the query as well (as speaker labels are excluded from the embedded dialog).
+    Conversely, if input query concerns the actual mention of a host's name in the dialog, e.g. "Fetch instances where Jack Brett refers to himself in third person", the host name should remain in the query.
+    Your output must be a JSON-parsable object with two fields:\n
+    query (string) - revised semantic search query excluding references to speaker names or tonal information (or the original query if no host names mentioned and 'tone' filter not applicable)\n
+    tone (string) - the tone best represented by the query (must be BANTER, DEBATE, LOGISTICS, or None)\n
+    Examples:\n
+    1. For query 'Fetch any mentions of TV or movies about serial killers', you would output:\n
+    {"query": "TV or movies about serial killers", "tone": "None"}\n
+    2. For query 'Fetch any arguments about Trump's alleged pandering to White Supremacists', you would output:\n
+    {"query": "Trump pandering to White Supremacists", "tone": "DEBATE"}\n
+    3. For query 'Fetch any planning sessions for future episodes', you would output:\n
+    {"query": "Planning future episodes", "tone": "LOGISTICS"}\n
+    4. For query 'Fetch any jokes about Jack Brett's sparse sexual history', you would output:\n
+    {"query": "sparse sexual history", "tone": "BANTER"}\n
+    5. For query 'Fetch instances where Jess calls Jack Brett by name while coaching him on Zelda tactics', you would output:\n
+    {"query": "Jack Brett Zelda tips and tactics", "tone": "LOGISTICS"}\n
+    Return only the JSON object, no prose or additional reasoning.
 """)
 
 TONE_DESCRIPTIONS = {
@@ -294,13 +330,13 @@ def generate_hypothetical_documents(query: str, tone: DialogTone) -> list[str]:
     # filter out any blank/whitespace lines from result
     return [line for line in llm_output.split('\n') if line.strip()]
 
-def get_knn_search_query(query: str) -> SearchQuery:
-    search_query = anthropic_client.messages.create(
+def get_knn_query_for_line_index(query: str) -> LineQueryKNN:
+    line_query = anthropic_client.messages.create(
         model=CHAT_MODEL_ID,
-        response_model=SearchQuery,
+        response_model=LineQueryKNN,
         max_tokens=500,
         temperature=0.2,
-        system=QUERY_TO_KNN_PROMPT,
+        system=QUERY_TO_LINE_KNN_PROMPT,
         messages=[
             {
                 "role": "user",
@@ -308,40 +344,138 @@ def get_knn_search_query(query: str) -> SearchQuery:
             }
         ]
     )
-    return search_query
+    return line_query
 
-def get_top_k_vectors(text: str, filter_exp: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+def get_knn_query_for_dialog_index(query: str) -> DialogQueryKNN:
+    line_query = anthropic_client.messages.create(
+        model=CHAT_MODEL_ID,
+        response_model=DialogQueryKNN,
+        max_tokens=500,
+        temperature=0.2,
+        system=QUERY_TO_DIALOG_KNN_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Query:\n{query}"
+            }
+        ]
+    )
+    return line_query
+
+def get_top_k_vectors(index_name: str, text: str, filter_exp: Dict[str, Any] | None = None, k: int = 8) -> List[Dict[str, Any]]:
     query_embedding = embed_text(text)
     
     response = s3vectors.query_vectors(
         vectorBucketName=VECTOR_BUCKET_NAME,
-        indexName=VECTOR_INDEX_NAME,
+        indexName=index_name,
         queryVector={"float32": query_embedding},
-        topK=TOP_K,
+        topK=k,
         returnMetadata=True,
         returnDistance=True,
         filter=filter_exp
     )
     return response.get("vectors", [])
 
-def retrieve_context(query: str) -> List[Dict[str, Any]]:
-    vectors = []
-    knn_query = get_knn_search_query(query)
+def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector]:
+    all_vectors = []
+    relevant_vectors: List[RelevantVector] = []
+    # break down query into search tasks
+    search_tasks = get_search_tasks_for_query(query)
+    # run kNN search for each task
+    for task in search_tasks:
+        print(f"TASK: {task}")
+        knn_query = get_knn_query_for_line_index(task)
+        print(f"query: {knn_query.query}")
+        print(f"filter_exp: {knn_query.filter_exp}")
+        all_vectors.extend(get_top_k_vectors(
+            LINE_INDEX_NAME,
+            text=knn_query.query,
+            filter_exp=knn_query.filter_exp,
+            k=TOP_K
+        ))
+    # deduplicate by key
+    deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
+    # order by k-NN distance
+    ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
+    # filter results by relevance to query
+    for i in range(len(ordered_vectors)):
+        if len(relevant_vectors) >= max_hits:
+            # return early if we have enough relevant hits
+            return relevant_vectors
+
+        vector = ordered_vectors[i]
+        transcript_exchange = get_n_surrounding_lines(vector, n=5)
+        str_exchange = stringify_exchange(transcript_exchange)
+        relevance: RelevanceDecision = get_exchange_relevance(query, str_exchange)
+        print(f"RELEVANCE: {relevance}")
+        if relevance.is_relevant:
+            relevant_vectors.append(RelevantVector(
+                episode_id=transcript_exchange.episode_id,
+                date=transcript_exchange.date,
+                timestamp=transcript_exchange.timestamp,
+                text=str_exchange,
+                score=transcript_exchange.score
+            ))
+    # we didn't meet the max_hits benchmark. return what we've got
+    return relevant_vectors
+
+def retrieve_dialog_vectors(query: str, max_hits: int = 25) -> List[RelevantVector]:
+    all_vectors = []
+    relevant_vectors: List[RelevantVector] = []
+    # remove host names from query (no speaker labels in dialog index)
+    no_hostname_query = scrub_host_names_from_query(query)
+    knn_query: DialogQueryKNN = get_knn_query_for_dialog_index(no_hostname_query)
     print(f"query: {knn_query.query}")
-    print(f"filter_exp: {knn_query.filter_exp}")
-    print(f"label: {knn_query.label}")
     print(f"tone: {knn_query.tone}")
-    if knn_query.label in [DialogLabel.TONE, DialogLabel.MIXED]:
+    if knn_query.tone is not None:
         # use HyDE strategy
         print("Tone detected. Generating hypothetical documents...")
         hyde_docs = generate_hypothetical_documents(knn_query.query, knn_query.tone)
         for hd in hyde_docs:
             print(hd)
-            vectors.extend(get_top_k_vectors(hd, knn_query.filter_exp))
+            all_vectors.extend(get_top_k_vectors(
+                DIALOG_INDEX_NAME,
+                text=knn_query.query,
+                filter_exp={"tone": {"$eq": knn_query.tone}},
+                k=3
+            ))
     else:
-        # skip HyDE. query is topic-specific enough
-        vectors.extend(get_top_k_vectors(knn_query.query, knn_query.filter_exp))
-    return vectors
+        # no tone detected. run query as is
+        all_vectors = get_top_k_vectors(
+            DIALOG_INDEX_NAME,
+            text=knn_query.query,
+            filter_exp=None,
+            k=TOP_K
+        )
+    # deduplicate by key
+    deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
+    # order by k-NN distance
+    ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
+    # filter results by relevance to query
+    for i in range(len(ordered_vectors)):
+        if len(relevant_vectors) >= max_hits:
+            # return early if we have enough relevant hits
+            return relevant_vectors
+
+        vector = ordered_vectors[i]
+        # transcript_exchange = get_n_surrounding_lines(vector, n=5)
+        metadata = vector.get("metadata")
+        str_exchange = metadata.get("text")
+        relevance: RelevanceDecision = get_exchange_relevance(no_hostname_query, str_exchange)
+        print(str_exchange)
+        print(f"RELEVANCE: {relevance}")
+        if relevance.is_relevant:
+            k_distance = vector.get("distance", 1)
+            score = 100 - int(k_distance * 100)
+            relevant_vectors.append(RelevantVector(
+                episode_id=metadata["episode_id"],
+                date=metadata["date"],
+                timestamp=str(metadata["start_time"]),
+                text=str_exchange,
+                score=score
+            ))
+    # we didn't meet the max_hits benchmark. return what we've got
+    return relevant_vectors
 
 def get_search_tasks_for_query(query: str) -> List[str]:
     """
@@ -382,7 +516,40 @@ def get_search_tasks_for_query(query: str) -> List[str]:
     
     return llm_output.split('\n')
 
-def dedupe_vectors_by_key(
+def scrub_host_names_from_query(query: str) -> str:
+    SCRUB_HOST_NAMES_PROMPT = textwrap.dedent(f"""
+        You are a helpful research assistant for the However Comma podcast hosted by Jack Brett and Jess.
+        Your task is to scrub the user query of references to the two hosts, preserving as much of the semantic meaning as possible.
+        Only scrub references to Jack Brett and Jess. Any other proper nouns must be preserved.
+        Examples:\n
+        1. For the query "Fetch any statements that indicate Jack Brett's position on free will", you would output:\n
+        "Fetch any statements that indicate a position on free will"\n
+        2. For the query "Fetch any argumentative statements Jess made about Trump's alleged pandering to White Supremacists in early 2025 (January-March)", you would output:\n
+        "Fetch any argumentative statements about Trump's alleged pandering to White Supremacists in early 2025 (January-March)"
+        3. For the query "Fetch any heated discussions about the death of Charlie Kirk", you would output the same query unaltered:\n
+        "Fetch any heated discussions about the death of Charlie Kirk"
+        Output only the edited query, no prose or additional reasoning.
+        USER QUERY: {query}
+    """)
+    response = bedrock_runtime.invoke_model(
+            modelId=CHAT_MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 600,
+                "temperature": 0.2,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": SCRUB_HOST_NAMES_PROMPT
+                    }
+                ]
+            })
+        )
+    resp_body = json.loads(response["body"].read())
+    llm_output = resp_body["content"][0]["text"]
+    return llm_output
+
+def dedupe_line_vectors_by_key(
     vectors: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     seen_keys: set[str] = set()
@@ -399,48 +566,6 @@ def dedupe_vectors_by_key(
             deduped.append(v)
 
     return deduped
-
-def get_vector_relevance(
-    original_query: str,
-    vector: Dict[str, Any],
-) -> RelevanceDecision:
-    prompt = textwrap.dedent(f"""
-        You are a strict relevance judge for a research assistant.
-        Your job is to decide whether a transcript excerpt is useful for answering the user's original question.
-        Be conservative.
-        If the excerpt is only tangentially related, judge it as NOT RELEVANT.
-
-        USER QUESTION:
-        {original_query}
-
-        TRANSCRIPT EXCERPT:
-        Speaker: {vector['speaker']}
-        Date: {vector['date']}
-        Timestamp: {vector['timestamp']}
-        Text:
-        "{vector['text']}"
-
-        Is this excerpt useful for answering the user's question?
-
-        Respond ONLY in JSON with this schema:
-        {{
-        "relevant": boolean,
-        "confidence": number,   // 0-100
-        "reason": string        // short, max 1 sentence
-        }}
-    """)
-    return bedrock_client.create(
-        model=RELEVANCE_MODEL_ID,
-        response_model=RelevanceDecision,
-        max_tokens=300,
-        temperature=0.0,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
 
 def get_n_surrounding_lines(vector: Dict[str, Any], n: int = 3) -> TranscriptExchange:
     """
@@ -497,9 +622,8 @@ def stringify_exchange(exchange: TranscriptExchange) -> str:
         {formatted_lines}
     """)
 
-def format_exchange_relevance_prompt(user_query: str, exchange: TranscriptExchange) -> str:
+def format_exchange_relevance_prompt(user_query: str, exchange: str) -> str:
     
-    str_exchange = stringify_exchange(exchange)
     return textwrap.dedent(f"""
         You are a strict relevance judge for a research assistant.
         Your job is to decide whether a transcript excerpt is useful for answering the user's original question.
@@ -509,7 +633,7 @@ def format_exchange_relevance_prompt(user_query: str, exchange: TranscriptExchan
         USER QUESTION:
         {user_query}
 
-        {str_exchange}
+        {exchange}
 
         Is this excerpt useful for answering the user's question?
 
@@ -521,7 +645,7 @@ def format_exchange_relevance_prompt(user_query: str, exchange: TranscriptExchan
         }}
     """)
 
-def get_exchange_relevance(user_query: str, exchange: TranscriptExchange) -> RelevanceDecision:
+def get_exchange_relevance(user_query: str, exchange: str) -> RelevanceDecision:
     """
     Determine relevance of a particular exchange from transcript
     by comparing to user query via LLM
@@ -542,37 +666,24 @@ def get_exchange_relevance(user_query: str, exchange: TranscriptExchange) -> Rel
         )
 
 def get_curated_context(query: str, max_hits: int = 25) -> List[TranscriptExchange]:
-    all_context = []
-    relevant_exchanges: List[TranscriptExchange] = []
-    search_tasks = get_search_tasks_for_query(query)
-    for task in search_tasks:
-        print(f"TASK: {task}")
-        task_context_items = retrieve_context(task)
-        all_context.extend(task_context_items)
-    # deduplicate by key
-    deduped_context = dedupe_vectors_by_key(all_context)
-    # order by k-NN distance
-    ordered_context = sorted(deduped_context, key=lambda x: x['distance'], reverse=True)
-    # filter by relevance
-    for i in range(len(ordered_context)):
-        if len(relevant_exchanges) >= max_hits:
-            # return early if we have enough relevant hits
-            return relevant_exchanges
+    relevant_vectors: List[RelevantVector] = []
+    # Run query against LINE INDEX first
+    line_vectors = retrieve_line_vectors(query, max_hits)
+    print(f"{len(line_vectors)} relevant line vectors")
+    for lv in line_vectors:
+        print(lv.text)
+    relevant_vectors.extend(line_vectors)
 
-        vector = ordered_context[i]
-        exchange = get_n_surrounding_lines(vector, n=5)
-        relevance: RelevanceDecision = get_exchange_relevance(query, exchange)
-        print(stringify_exchange(exchange))
-        print(f"RELEVANCE: {relevance}")
-        if relevance.is_relevant:
-            relevant_exchanges.append(exchange)
-    # we didn't meet the max_hits benchmark. return what we've got
-    return relevant_exchanges
-
+    dialog_vectors = retrieve_dialog_vectors(query, max_hits)
+    print(f"{len(dialog_vectors)} relevant dialog vectors")
+    for dv in dialog_vectors:
+        print(dv.text)
+    relevant_vectors.extend(dialog_vectors)
+    return relevant_vectors
 
 def build_rag_prompt_with_context(
     latest_user_query: str,
-    context: List[TranscriptExchange],
+    context: List[RelevantVector],
     messages: list[dict] | None = None,
     max_history_turns: int = 4,
 ) -> str:
@@ -593,7 +704,7 @@ def build_rag_prompt_with_context(
     if not context:
         context_block = "No relevant podcast excerpts were found.\n"
     else:
-        blocks = [stringify_exchange(exchange) for exchange in context]
+        blocks = [exchange.text for exchange in context]
         context_block = "Podcast transcript excerpts:\n\n" + "\n".join(blocks)
 
     # Include recent conversation history if referential language detected
