@@ -404,7 +404,13 @@ def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector
             return relevant_vectors
 
         vector = ordered_vectors[i]
-        transcript_exchange = get_n_surrounding_lines(vector, n=5)
+        try:
+            transcript_exchange = get_n_surrounding_lines(vector, n=5)
+        except ValueError:
+            metadata = vector.get("metadata")
+            print(f"Line not found in DynamoDB: episode_id: {metadata.get("episode_id")}, text: {metadata.get("text")}, line_id: {vector.get("key")}")
+            continue
+
         str_exchange = stringify_exchange(transcript_exchange)
         relevance: RelevanceDecision = get_exchange_relevance(query, str_exchange)
         print(f"RELEVANCE: {relevance}")
@@ -569,14 +575,14 @@ def dedupe_line_vectors_by_key(
 
 def get_n_surrounding_lines(vector: Dict[str, Any], n: int = 3) -> TranscriptExchange:
     """
-    Fetch n transcript lines immediately before and after line_id
-    (in order to place the lines returned by semantic search in
-    their appropriate context within the conversation to determine
-    relevance)
+    Fetch up to n transcript lines immediately before and after line_id.
+    If the line is within fewer than n lines of the episode boundary,
+    only the available lines in that direction are returned.
     """
     line_id = vector.get("key")
     k_distance = vector.get("distance")
     score = 100 - int(k_distance * 100)
+
     try:
         fetch_line_resp = transcript_table.query(
             IndexName="line_id_index",
@@ -584,24 +590,32 @@ def get_n_surrounding_lines(vector: Dict[str, Any], n: int = 3) -> TranscriptExc
             ExpressionAttributeValues={":lid": line_id},
             Limit=1
         )
-        item = fetch_line_resp["Items"][0]
+        items = fetch_line_resp.get("Items", [])
+        if not items:
+            raise ValueError(f"No transcript line found for line_id: {line_id}")
+
+        item = items[0]
         episode_id = item["episode_id"]
         episode_date = item["date"]
         line_position = item["line_position"]
+
+        start_position = max(0, line_position - n)
 
         adjacent_lines_resp = transcript_table.query(
             KeyConditionExpression=
                 "episode_id = :ep AND line_position BETWEEN :start AND :end",
             ExpressionAttributeValues={
                 ":ep": episode_id,
-                ":start": line_position - n,
+                ":start": start_position,
                 ":end": line_position + n,
             },
             ScanIndexForward=True
         )
-        adjacent_lines = adjacent_lines_resp.get("Items")
-        start_timestamp = adjacent_lines[0]["timestamp"]
+        adjacent_lines = adjacent_lines_resp.get("Items", [])
+        if not adjacent_lines:
+            raise ValueError(f"No adjacent lines found for episode: {episode_id}, position: {line_position}")
 
+        start_timestamp = adjacent_lines[0]["timestamp"]
         return TranscriptExchange(
             episode_id=episode_id,
             date=episode_date,
@@ -609,6 +623,7 @@ def get_n_surrounding_lines(vector: Dict[str, Any], n: int = 3) -> TranscriptExc
             lines=adjacent_lines,
             timestamp=start_timestamp
         )
+
     except Exception as e:
         print(f"Error occurred fetching surrounding lines: {e}")
         raise
@@ -665,7 +680,7 @@ def get_exchange_relevance(user_query: str, exchange: str) -> RelevanceDecision:
             ]
         )
 
-def get_curated_context(query: str, max_hits: int = 25) -> List[TranscriptExchange]:
+def get_curated_context(query: str, max_hits: int = 25) -> List[RelevantVector]:
     relevant_vectors: List[RelevantVector] = []
     # Run query against LINE INDEX first
     line_vectors = retrieve_line_vectors(query, max_hits)
@@ -808,23 +823,23 @@ def lambda_handler(event, context):
             raise Exception("User query missing from request")
 
         # retrieve relevant transcript chunks
-        relevant_exchanges = get_curated_context(user_query)
+        relevant_vectors = get_curated_context(user_query)
         # assemble RAG prompt
         prompt = build_rag_prompt_with_context(
             user_query,
-            relevant_exchanges,
+            relevant_vectors,
             messages,
         )
         # get answer from LLM
         answer = call_llm(prompt)
         sources = []
-        for exchange in relevant_exchanges:
+        for vector in relevant_vectors:
             sources.append({
-                "episode_id": exchange.episode_id,
-                "episode_name": episode_id_to_name(exchange.episode_id),
-                "text": stringify_exchange(exchange),
-                "date": exchange.date,
-                "score": exchange.score,
+                "episode_id": vector.episode_id,
+                "episode_name": episode_id_to_name(vector.episode_id),
+                "text": vector.text,
+                "date": vector.date,
+                "score": vector.score,
             })
 
         # Write success result
