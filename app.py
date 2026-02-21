@@ -89,12 +89,27 @@ class TranscriptExchange(BaseModel):
     lines: list[TranscriptLine] = Field(description="A sequence of lines from episode transcript")
     score: int = Field(description="K-NN similarity score of the central line of the exchange")
 
-class RelevantVector(BaseModel):
+class RelevantSource(BaseModel):
     episode_id: str = Field(description="Episode ID of exchange")
     date: str = Field(description="Date of recording")
     timestamp: str = Field(description="Timestamp of the exchange relative to start of episode")
     text: str = Field(description="Stringified sequence of lines from episode transcript")
     score: int = Field(description="K-NN similarity score of the central line of the exchange")
+
+class QueryType(str, Enum):
+    DIRECT_SEARCH = "DIRECT_SEARCH"
+    RAG_SEARCH = "RAG_SEARCH"
+
+class QueryTypeDecision(BaseModel):
+    label: QueryType = Field(description="The type of search query identified by LLM, which will inform search strategy")
+
+class QueryResponse(BaseModel):
+    answer: str = Field(description="Final answer to user query")
+    sources: List[RelevantSource] = Field(description="The list of search hits from vector index determined to be relevant to query")
+
+class ChatMessage(BaseModel):
+    role: str = Field(description="Message role (user or system)")
+    content: str = Field(description="Message content")
 
 # regex patterns to detect when user prompt refers to earlier chat history
 PRONOUN_PATTERN = re.compile(
@@ -297,6 +312,39 @@ def embed_text(text: str) -> List[float]:
     body = json.loads(response["body"].read())
     return body["embedding"]
 
+def get_query_type(query: str) -> QueryTypeDecision:
+    GET_QUERY_TYPE_PROMPT = textwrap.dedent("""
+        You are a helpful research assistant for the However Comma podcast hosted by Jack Brett and Jess.
+        Your task is to analyze a search query and classify it as either RAG_SEARCH or DIRECT_SEARCH, which will determine whether to embed it as is for semantic search (K-NN) against a vector index, or use it to plan out a more sophisticated RAG strategy including metadata filters.\n
+        You will classify it as follows:\n
+        RAG_SEARCH - query is a clear instruction from a user to a research tool (as opposed to a raw search string) and/or contains information that could be used to filter search results by host name, episode date, etc.\n
+        DIRECT_SEARCH - query appears to be a raw search string intended to be used directly in semantic search, contains no instructions on how to perform search or what metadata field(s) to filter by\n
+        Respond ONLY a JSON object with a single key 'label' whose value is your classification:\n
+        {"label": string}\n
+        Examples:\n
+        1. For query "Please find examples of Jack Brett telling Jess to 'get out' and Jess replying 'i will not'", you would output:\n
+        {"label": "RAG_SEARCH"}\n
+        2. For query "Please give examples of Jack and Jess in heated debate over which political party is more guilty of fear mongering", you would output:\n
+        {"label": "RAG_SEARCH"}\n
+        3. For query "Trump is not opposed to introducing his cabinet members to the undercarriage of a bus", you would output:\n
+        {"label": "DIRECT_SEARCH"}\n
+        4. For query "It's hard to give our elected leaders the benefit of the doubt because...history?", you would output:\n
+        {"label": "DIRECT_SEARCH"}\n
+    """)
+    query_type_decision = anthropic_client.messages.create(
+        model=CHAT_MODEL_ID,
+        response_model=QueryTypeDecision,
+        max_tokens=500,
+        temperature=0.2,
+        system=GET_QUERY_TYPE_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Query:\n{query}"
+            }
+        ]
+    )
+    return query_type_decision
 
 def get_hyde_prompt_for_query_and_tone(query: str, tone: str) -> str:
     description = TONE_DESCRIPTIONS[tone]
@@ -376,9 +424,9 @@ def get_top_k_vectors(index_name: str, text: str, filter_exp: Dict[str, Any] | N
     )
     return response.get("vectors", [])
 
-def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector]:
+def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantSource]:
     all_vectors = []
-    relevant_vectors: List[RelevantVector] = []
+    relevant_sources: List[RelevantSource] = []
     # break down query into search tasks
     search_tasks = get_search_tasks_for_query(query)
     # run kNN search for each task
@@ -399,9 +447,9 @@ def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector
     ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
     # filter results by relevance to query
     for i in range(len(ordered_vectors)):
-        if len(relevant_vectors) >= max_hits:
+        if len(relevant_sources) >= max_hits:
             # return early if we have enough relevant hits
-            return relevant_vectors
+            return relevant_sources
 
         vector = ordered_vectors[i]
         try:
@@ -415,7 +463,7 @@ def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector
         relevance: RelevanceDecision = get_exchange_relevance(query, str_exchange)
         print(f"RELEVANCE: {relevance}")
         if relevance.is_relevant:
-            relevant_vectors.append(RelevantVector(
+            relevant_sources.append(RelevantSource(
                 episode_id=transcript_exchange.episode_id,
                 date=transcript_exchange.date,
                 timestamp=transcript_exchange.timestamp,
@@ -423,36 +471,20 @@ def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantVector
                 score=transcript_exchange.score
             ))
     # we didn't meet the max_hits benchmark. return what we've got
-    return relevant_vectors
+    return relevant_sources
 
-def retrieve_dialog_vectors(query: str, max_hits: int = 25) -> List[RelevantVector]:
+def retrieve_dialog_vectors(query: str, max_hits: int = 25) -> List[RelevantSource]:
     all_vectors = []
-    relevant_vectors: List[RelevantVector] = []
+    relevant_vectors: List[RelevantSource] = []
     # remove host names from query (no speaker labels in dialog index)
     no_hostname_query = scrub_host_names_from_query(query)
-    knn_query: DialogQueryKNN = get_knn_query_for_dialog_index(no_hostname_query)
-    print(f"query: {knn_query.query}")
-    print(f"tone: {knn_query.tone}")
-    if knn_query.tone is not None:
-        # use HyDE strategy
-        print("Tone detected. Generating hypothetical documents...")
-        hyde_docs = generate_hypothetical_documents(knn_query.query, knn_query.tone)
-        for hd in hyde_docs:
-            print(hd)
-            all_vectors.extend(get_top_k_vectors(
-                DIALOG_INDEX_NAME,
-                text=knn_query.query,
-                filter_exp={"tone": {"$eq": knn_query.tone}},
-                k=3
-            ))
-    else:
-        # no tone detected. run query as is
-        all_vectors = get_top_k_vectors(
-            DIALOG_INDEX_NAME,
-            text=knn_query.query,
-            filter_exp=None,
-            k=TOP_K
-        )
+    print(f"no_hostname_query: {no_hostname_query}")
+    all_vectors = get_top_k_vectors(
+        DIALOG_INDEX_NAME,
+        text=no_hostname_query,
+        filter_exp=None,
+        k=TOP_K
+    )
     # deduplicate by key
     deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
     # order by k-NN distance
@@ -473,7 +505,7 @@ def retrieve_dialog_vectors(query: str, max_hits: int = 25) -> List[RelevantVect
         if relevance.is_relevant:
             k_distance = vector.get("distance", 1)
             score = 100 - int(k_distance * 100)
-            relevant_vectors.append(RelevantVector(
+            relevant_vectors.append(RelevantSource(
                 episode_id=metadata["episode_id"],
                 date=metadata["date"],
                 timestamp=str(metadata["start_time"]),
@@ -641,11 +673,11 @@ def format_exchange_relevance_prompt(user_query: str, exchange: str) -> str:
     
     return textwrap.dedent(f"""
         You are a strict relevance judge for a research assistant.
-        Your job is to decide whether a transcript excerpt is useful for answering the user's original question.
+        Your job is to decide whether a transcript excerpt is useful for answering the user's original query.
         Be conservative.
         If the excerpt is only tangentially related, judge it as NOT RELEVANT.
 
-        USER QUESTION:
+        USER QUERY:
         {user_query}
 
         {exchange}
@@ -680,25 +712,25 @@ def get_exchange_relevance(user_query: str, exchange: str) -> RelevanceDecision:
             ]
         )
 
-def get_curated_context(query: str, max_hits: int = 25) -> List[RelevantVector]:
-    relevant_vectors: List[RelevantVector] = []
+def get_curated_context(query: str, max_hits: int = 25) -> List[RelevantSource]:
+    relevant_sources: List[RelevantSource] = []
     # Run query against LINE INDEX first
     line_vectors = retrieve_line_vectors(query, max_hits)
     print(f"{len(line_vectors)} relevant line vectors")
     for lv in line_vectors:
         print(lv.text)
-    relevant_vectors.extend(line_vectors)
+    relevant_sources.extend(line_vectors)
 
     dialog_vectors = retrieve_dialog_vectors(query, max_hits)
     print(f"{len(dialog_vectors)} relevant dialog vectors")
     for dv in dialog_vectors:
         print(dv.text)
-    relevant_vectors.extend(dialog_vectors)
-    return relevant_vectors
+    relevant_sources.extend(dialog_vectors)
+    return relevant_sources
 
 def build_rag_prompt_with_context(
     latest_user_query: str,
-    context: List[RelevantVector],
+    context: List[RelevantSource],
     messages: list[dict] | None = None,
     max_history_turns: int = 4,
 ) -> str:
@@ -779,6 +811,44 @@ def call_llm(prompt: str) -> str:
     body = json.loads(response["body"].read())
     return body["content"][0]["text"]
 
+def direct_search(query: str) -> QueryResponse:
+    top_hits = get_top_k_vectors(LINE_INDEX_NAME, query)
+    deduped_vectors = dedupe_line_vectors_by_key(top_hits)
+    # order by k-NN distance
+    ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
+    sources = []
+    for vector in ordered_vectors:
+        metadata = vector.get("metadata")
+        k_distance = vector.get("distance", 1)
+        score = 100 - int(k_distance * 100)
+
+        sources.append(RelevantSource(
+            episode_id=metadata.get("episode_id"),
+            date=metadata.get("date"),
+            timestamp=metadata.get("timestamp"),
+            text=metadata.get("text"),
+            score=score
+        ))
+    return QueryResponse(
+        answer="Your search returned the following excerpts:",
+        sources=sources
+    )
+
+def rag_search(query: str, messages: List[ChatMessage]) -> QueryResponse:
+    relevant_sources = get_curated_context(query)
+    # assemble RAG prompt
+    prompt = build_rag_prompt_with_context(
+        query,
+        relevant_sources,
+        messages,
+    )
+    # get answer from LLM
+    answer = call_llm(prompt)
+
+    return QueryResponse(
+        answer=answer,
+        sources=relevant_sources
+    )
 
 def lambda_handler(event, context):
     request_id = event.get("request_id")
@@ -822,23 +892,26 @@ def lambda_handler(event, context):
         if not user_query:
             raise Exception("User query missing from request")
 
-        # retrieve relevant transcript chunks
-        relevant_vectors = get_curated_context(user_query)
-        # assemble RAG prompt
-        prompt = build_rag_prompt_with_context(
-            user_query,
-            relevant_vectors,
-            messages,
-        )
-        # get answer from LLM
-        answer = call_llm(prompt)
+        query_response: QueryResponse | None = None
+        # determine if this is a DIRECT or RAG search
+        query_type = get_query_type(user_query)
+        if query_type == QueryType.DIRECT_SEARCH:
+            query_response = direct_search(user_query)
+        elif query_type == QueryType.RAG_SEARCH:
+            query_response = rag_search(user_query, messages)
+
+        if not query_response:
+            raise Exception("Search failed. Could not identify query type")
+
         sources = []
-        for vector in relevant_vectors:
+        # format sources for storage in dynamodb table
+        for vector in query_response.sources:
             sources.append({
                 "episode_id": vector.episode_id,
                 "episode_name": episode_id_to_name(vector.episode_id),
                 "text": vector.text,
                 "date": vector.date,
+                "timestamp": vector.timestamp,
                 "score": vector.score,
             })
 
@@ -857,7 +930,7 @@ def lambda_handler(event, context):
             },
             ExpressionAttributeValues={
                 ":status": "complete",
-                ":answer": answer,
+                ":answer": query_response.answer,
                 ":sources": sources,
                 ":now": _now()
             },
