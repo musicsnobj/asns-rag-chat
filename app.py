@@ -895,9 +895,9 @@ def lambda_handler(event, context):
         query_response: QueryResponse | None = None
         # determine if this is a DIRECT or RAG search
         query_type = get_query_type(user_query)
-        if query_type == QueryType.DIRECT_SEARCH:
+        if query_type.label == QueryType.DIRECT_SEARCH:
             query_response = direct_search(user_query)
-        elif query_type == QueryType.RAG_SEARCH:
+        elif query_type.label == QueryType.RAG_SEARCH:
             query_response = rag_search(user_query, messages)
 
         if not query_response:
