@@ -31,7 +31,6 @@ DIALOG_INDEX_NAME = os.environ["DIALOG_INDEX"]
 CHAT_TABLE_NAME = os.environ["CHAT_TABLE_NAME"]
 TRANSCRIPT_TABLE_NAME = os.environ["TRANSCRIPT_TABLE_NAME"]
 
-TOP_K = 8
 
 dynamodb = boto3.resource("dynamodb")
 
@@ -424,22 +423,25 @@ def get_top_k_vectors(index_name: str, text: str, filter_exp: Dict[str, Any] | N
     )
     return response.get("vectors", [])
 
-def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantSource]:
+def retrieve_line_vectors(query: str, max_hits: int = 15) -> List[RelevantSource]:
     all_vectors = []
     relevant_sources: List[RelevantSource] = []
     # break down query into search tasks
     search_tasks = get_search_tasks_for_query(query)
+    base_k = round(max_hits / len(search_tasks))
     # run kNN search for each task
     for task in search_tasks:
         print(f"TASK: {task}")
         knn_query = get_knn_query_for_line_index(task)
         print(f"query: {knn_query.query}")
         print(f"filter_exp: {knn_query.filter_exp}")
+        # fetch 50% more vectors than we need (will likely lose some to relevance filter)
+        top_k = round(base_k + base_k*0.5)
         all_vectors.extend(get_top_k_vectors(
             LINE_INDEX_NAME,
             text=knn_query.query,
             filter_exp=knn_query.filter_exp,
-            k=TOP_K
+            k=top_k
         ))
     # deduplicate by key
     deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
@@ -473,17 +475,18 @@ def retrieve_line_vectors(query: str, max_hits: int = 25) -> List[RelevantSource
     # we didn't meet the max_hits benchmark. return what we've got
     return relevant_sources
 
-def retrieve_dialog_vectors(query: str, max_hits: int = 25) -> List[RelevantSource]:
+def retrieve_dialog_vectors(query: str, max_hits: int = 15) -> List[RelevantSource]:
     all_vectors = []
     relevant_vectors: List[RelevantSource] = []
     # remove host names from query (no speaker labels in dialog index)
     no_hostname_query = scrub_host_names_from_query(query)
-    print(f"no_hostname_query: {no_hostname_query}")
+    # fetch 50% more vectors than we need (will likely lose some to relevance filter)
+    top_k = round(max_hits + max_hits*0.5)
     all_vectors = get_top_k_vectors(
         DIALOG_INDEX_NAME,
         text=no_hostname_query,
         filter_exp=None,
-        k=TOP_K
+        k=top_k
     )
     # deduplicate by key
     deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
@@ -712,7 +715,7 @@ def get_exchange_relevance(user_query: str, exchange: str) -> RelevanceDecision:
             ]
         )
 
-def get_curated_context(query: str, max_hits: int = 25) -> List[RelevantSource]:
+def get_curated_context(query: str, max_hits: int = 15) -> List[RelevantSource]:
     relevant_sources: List[RelevantSource] = []
     # Run query against LINE INDEX first
     line_vectors = retrieve_line_vectors(query, max_hits)
@@ -721,6 +724,9 @@ def get_curated_context(query: str, max_hits: int = 25) -> List[RelevantSource]:
         print(lv.text)
     relevant_sources.extend(line_vectors)
 
+    if len(relevant_sources) >= max_hits:
+        # skip search of dialog index if we already have enough relevant context
+        return relevant_sources
     dialog_vectors = retrieve_dialog_vectors(query, max_hits)
     print(f"{len(dialog_vectors)} relevant dialog vectors")
     for dv in dialog_vectors:
