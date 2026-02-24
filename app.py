@@ -426,6 +426,7 @@ def get_top_k_vectors(index_name: str, text: str, filter_exp: Dict[str, Any] | N
 def retrieve_line_vectors(query: str, max_hits: int = 15) -> List[RelevantSource]:
     all_vectors = []
     relevant_sources: List[RelevantSource] = []
+    unique_keys = set()
     # break down query into search tasks
     search_tasks = get_search_tasks_for_query(query)
     base_k = round(max_hits / len(search_tasks))
@@ -444,7 +445,7 @@ def retrieve_line_vectors(query: str, max_hits: int = 15) -> List[RelevantSource
             k=top_k
         ))
     # deduplicate by key
-    deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
+    deduped_vectors = dedupe_vectors_by_key(all_vectors)
     # order by k-NN distance
     ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
     # filter results by relevance to query
@@ -454,13 +455,18 @@ def retrieve_line_vectors(query: str, max_hits: int = 15) -> List[RelevantSource
             return relevant_sources
 
         vector = ordered_vectors[i]
+        key = vector.get('key')
+        if key in unique_keys:
+            print(f"skipping vector {key} - already exists in another dialogue exchange")
+            continue
         try:
             transcript_exchange = get_n_surrounding_lines(vector, n=5)
         except ValueError:
             metadata = vector.get("metadata")
             print(f"Line not found in DynamoDB: episode_id: {metadata.get("episode_id")}, text: {metadata.get("text")}, line_id: {vector.get("key")}")
             continue
-
+        keys_in_exchange = [line.line_id for line in transcript_exchange.lines]
+        unique_keys.update(keys_in_exchange)
         str_exchange = stringify_exchange(transcript_exchange)
         relevance: RelevanceDecision = get_exchange_relevance(query, str_exchange)
         print(f"RELEVANCE: {relevance}")
@@ -489,7 +495,7 @@ def retrieve_dialog_vectors(query: str, max_hits: int = 15) -> List[RelevantSour
         k=top_k
     )
     # deduplicate by key
-    deduped_vectors = dedupe_line_vectors_by_key(all_vectors)
+    deduped_vectors = dedupe_vectors_by_key(all_vectors)
     # order by k-NN distance
     ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
     # filter results by relevance to query
@@ -503,7 +509,6 @@ def retrieve_dialog_vectors(query: str, max_hits: int = 15) -> List[RelevantSour
         metadata = vector.get("metadata")
         str_exchange = metadata.get("text")
         relevance: RelevanceDecision = get_exchange_relevance(no_hostname_query, str_exchange)
-        print(str_exchange)
         print(f"RELEVANCE: {relevance}")
         if relevance.is_relevant:
             k_distance = vector.get("distance", 1)
@@ -590,7 +595,7 @@ def scrub_host_names_from_query(query: str) -> str:
     llm_output = resp_body["content"][0]["text"]
     return llm_output
 
-def dedupe_line_vectors_by_key(
+def dedupe_vectors_by_key(
     vectors: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     seen_keys: set[str] = set()
@@ -720,8 +725,6 @@ def get_curated_context(query: str, max_hits: int = 15) -> List[RelevantSource]:
     # Run query against LINE INDEX first
     line_vectors = retrieve_line_vectors(query, max_hits)
     print(f"{len(line_vectors)} relevant line vectors")
-    for lv in line_vectors:
-        print(lv.text)
     relevant_sources.extend(line_vectors)
 
     if len(relevant_sources) >= max_hits:
@@ -729,8 +732,6 @@ def get_curated_context(query: str, max_hits: int = 15) -> List[RelevantSource]:
         return relevant_sources
     dialog_vectors = retrieve_dialog_vectors(query, max_hits)
     print(f"{len(dialog_vectors)} relevant dialog vectors")
-    for dv in dialog_vectors:
-        print(dv.text)
     relevant_sources.extend(dialog_vectors)
     return relevant_sources
 
@@ -819,7 +820,7 @@ def call_llm(prompt: str) -> str:
 
 def direct_search(query: str) -> QueryResponse:
     top_hits = get_top_k_vectors(LINE_INDEX_NAME, query)
-    deduped_vectors = dedupe_line_vectors_by_key(top_hits)
+    deduped_vectors = dedupe_vectors_by_key(top_hits)
     # order by k-NN distance
     ordered_vectors = sorted(deduped_vectors, key=lambda x: x['distance'], reverse=True)
     sources = []
